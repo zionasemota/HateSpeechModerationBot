@@ -8,6 +8,8 @@ import re
 import requests
 from report import Report
 import pdb
+from openai import OpenAI
+from report import reports_to_moderate, users_reported, user_history
 
 # Set up logging to the console
 logger = logging.getLogger('discord')
@@ -24,7 +26,9 @@ with open(token_path) as f:
     # If you get an error here, it means your token is formatted incorrectly. Did you put it in quotes?
     tokens = json.load(f)
     discord_token = tokens['discord']
+    openai_token = tokens['openai']
 
+openai_client = OpenAI(api_key=openai_token)
 
 class ModBot(discord.Client):
     def __init__(self): 
@@ -53,7 +57,7 @@ class ModBot(discord.Client):
             for channel in guild.text_channels:
                 if channel.name == f'group-{self.group_num}-mod':
                     self.mod_channels[guild.id] = channel
-        
+                         
 
     async def on_message(self, message):
         '''
@@ -74,7 +78,9 @@ class ModBot(discord.Client):
         # Handle a help message
         if message.content == Report.HELP_KEYWORD:
             reply =  "Use the `report` command to begin the reporting process.\n"
-            reply += "Use the `cancel` command to cancel the report process.\n"
+            reply += "Use the `cancel` command to cancel the report/moderation process.\n"
+            reply += "Use the `moderator` command to begin the moderation process.\n"
+
             await message.channel.send(reply)
             return
 
@@ -82,7 +88,7 @@ class ModBot(discord.Client):
         responses = []
 
         # Only respond to messages if they're part of a reporting flow
-        if author_id not in self.reports and not message.content.startswith(Report.START_KEYWORD):
+        if author_id not in self.reports and not (message.content.startswith(Report.START_KEYWORD) or message.content.startswith(Report.MOD_KEYWORD)):
             return
 
         # If we don't currently have an active report for this user, add one
@@ -103,11 +109,74 @@ class ModBot(discord.Client):
         if not message.channel.name == f'group-{self.group_num}':
             return
 
-        # Forward the message to the mod channel
+        hate_percentage, type = await self.moderate_message(message.content)
         mod_channel = self.mod_channels[message.guild.id]
-        await mod_channel.send(f'Forwarded message:\n{message.author.name}: "{message.content}"')
-        scores = self.eval_text(message.content)
-        await mod_channel.send(self.code_format(scores))
+        if int(hate_percentage) > 50:
+            mod_channel = self.mod_channels[message.guild.id]
+            await mod_channel.send(f"**Moderation Alert**:\n`{message.author.name}: {message.content}`\nOffensive content liklihood score of: `{hate_percentage}`%\nType: `{type}`\n"
+                                   f"**This message has been automatically sent for moderation**\n"
+                                   f"-------------------------------------------------------------------------------------------------------------------\n")
+            
+            original_message = f"{message.author.name}: {message.content}"
+
+            if message.author.name not in user_history:
+                user_history[message.author.name] = [1, 0]
+            else:
+                user_history[message.author.name][0] += 1
+
+            report_message = (
+                f", flagged by moderation system\n\n"
+                f"Flagged Message:\n```{original_message}```\n"
+                f"Flagged message abuse type: `{type}`\n"
+                f"Flagged message offensive liklihood score: `{hate_percentage}%`\n\n"
+                f"`End report summary.`\n\n"
+                f"Moderator, please classify above flagged message (Spam, Hateful Content, Harassment, Imminent Danger, Invalid Report)"
+            )
+
+            if type.lower() == "imminent danger":
+                reports_to_moderate.insert(0, report_message)
+                users_reported.insert(0, message.author.name)
+            else:
+                users_reported.append(message.author.name)
+                reports_to_moderate.append(report_message)
+        else:
+            message_link = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{message.id}"
+            await mod_channel.send(f"The message: `{message.content}` from user `{message.author.name}` was not automatically"
+                                   f" flagged\n\nIt has a calculated offensive content likelihood score of: `{hate_percentage}%`\n"
+                                   f"In case this message should have been flagged and requires moderation, here is the message link to commence the report process:\n`{message_link}`\n"
+                                   f"-------------------------------------------------------------------------------------------------------------------\n")
+      
+        # Forward the message to the mod channel
+        # mod_channel = self.mod_channels[message.guild.id]
+        # await mod_channel.send(f'Forwarded message:\n{message.author.name}: "{message.content}"')
+        # scores = self.eval_text(message.content)
+        # await mod_channel.send(self.code_format(scores))
+    
+    async def moderate_message(self, message_content):
+        response = openai_client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You will assist me in content moderation. To do this, I will provide unreviewed"
+                 " messages from a chat and your only responses from here on out will be in the form of two strings with a space in between. "
+                 "The first string will be a percentage based on how likely the inout message is to actually being problematic "
+                 "in the sense that it requires further human moderation (with 0% meaning does not require any moderation and "
+                 "is fine all the way to 100% meaning this is very problematic and requires immediate moderation). "
+                 "The second string will be the type of harmful behavior which has to be one of: "
+                 "Spam, Hateful Content, Harassment, or Imminent Danger. You must follow this exact specified format "
+                 "for each output"},
+                {"role": "user", "content": f"Message: {message_content}\nClassification:"}
+            ],
+            model="gpt-4o",
+            max_tokens=10,
+            n=1,
+            stop=None,
+            temperature=0.7
+        )
+        
+        ans = response.choices[0].message.content.strip()
+        space_idx = ans.find(" ")
+        first = ans[: space_idx]
+        sec = ans[space_idx + 1:]
+        return first[: len(first) - 1], sec
 
     
     def eval_text(self, message):
